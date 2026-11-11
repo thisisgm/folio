@@ -22,7 +22,9 @@
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <cerrno>
 #include <clocale>
+#include <cstdio>
 
 // GIO's headers use `signals` as a struct member, which Qt defines as a
 // keyword.
@@ -267,6 +269,17 @@ static bool inside(const QString &folder, const QString &path) {
     return item.isDir() && !item.isSymLink() && (target == self || target.startsWith(self + '/'));
 }
 
+// A rename and nothing more. QFile::rename copies a file itself where a rename can't reach, uncounted and unstoppable.
+static bool renameOnly(const QString &from, const QString &to) {
+    const QByteArray source = QFile::encodeName(from), target = QFile::encodeName(to);
+    if (::renameat2(AT_FDCWD, source.constData(), AT_FDCWD, target.constData(), RENAME_NOREPLACE) == 0)
+        return true;
+    const int refused = errno;
+    // A drive that can't promise not to overwrite (some network mounts) gets a plain rename once the name is seen free.
+    const QFileInfo taken(to);
+    return refused == EINVAL && !taken.exists() && !taken.isSymLink() && ::rename(source.constData(), target.constData()) == 0;
+}
+
 QStringList FileOps::transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error, Progress *progress) {
     QStringList made;
     const QString target = QDir::cleanPath(folder);
@@ -301,7 +314,7 @@ QStringList FileOps::transfer(const QStringList &paths, const QString &folder, M
         // copy that removes each original once it's copied. A link is made
         // again rather than renamed, which across drives would copy what it
         // leads to.
-        if (move && !info.isSymLink() && QFile::rename(path, destination)) {
+        if (move && !info.isSymLink() && renameOnly(path, destination)) {
             made << name;
             continue;
         }

@@ -497,6 +497,21 @@ private slots:
         if (!other)
             QSKIP("Needs a second drive.");
         copyInto(other->path());
+        if (QTest::currentTestFailed())
+            return;
+
+        // A file moved to another drive is counted: it takes the copy a folder's files take, where Stop is read at every block, not a rename that copies by itself.
+        const auto kept = QFile(from.filePath("album/big.raw")).permissions();
+        FileOps::Progress crossing;
+        QCOMPARE(FileOps::transfer({from.filePath("album/big.raw")}, other->path(), FileOps::Move, &error, &crossing), QStringList({"big.raw"}));
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QCOMPARE(crossing.total.load(), big.size());
+        QCOMPARE(crossing.done.load(), big.size());
+        QVERIFY(!QFileInfo::exists(from.filePath("album/big.raw")));
+        QFile moved(other->filePath("big.raw"));
+        QVERIFY(moved.open(QIODevice::ReadOnly));
+        QCOMPARE(moved.readAll(), big);
+        QCOMPARE(moved.permissions(), kept);
     }
 
     void fileOpsStopACopyOrAMovePartway()
