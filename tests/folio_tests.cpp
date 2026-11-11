@@ -514,6 +514,45 @@ private slots:
         QCOMPARE(moved.permissions(), kept);
     }
 
+    void fileOpsMoveByClaimNeverReplaces()
+    {
+        // Where a drive can't promise not to replace, a move takes a free name or nothing: what is there stays.
+        QTemporaryDir dir;
+        const auto read = [](const QString &path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray("(not readable)");
+        };
+        write(dir.filePath(".folio-test"), "");
+        write(dir.filePath("a.txt"), "a");
+        write(dir.filePath("taken.txt"), "kept");
+        QVERIFY(!FileOps::moveByClaim(dir.filePath("a.txt"), dir.filePath("taken.txt")));
+        QCOMPARE(read(dir.filePath("taken.txt")), QByteArray("kept"));
+        QCOMPARE(read(dir.filePath("a.txt")), QByteArray("a"));
+        QVERIFY(FileOps::moveByClaim(dir.filePath("a.txt"), dir.filePath("b.txt")));
+        QCOMPARE(read(dir.filePath("b.txt")), QByteArray("a"));
+        QVERIFY(!QFileInfo::exists(dir.filePath("a.txt")));
+
+        QDir(dir.path()).mkpath("box/inner");
+        write(dir.filePath("box/inner/note.txt"), "n");
+        // An empty folder of that name is another's too, and a plain rename would replace it.
+        QDir(dir.path()).mkdir("empty");
+        QVERIFY(!FileOps::moveByClaim(dir.filePath("box"), dir.filePath("empty")));
+        QVERIFY(!FileOps::moveByClaim(dir.filePath("box"), dir.filePath("taken.txt")));
+        QCOMPARE(QDir(dir.filePath("empty")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden), QStringList());
+        QCOMPARE(read(dir.filePath("box/inner/note.txt")), QByteArray("n"));
+        QVERIFY(FileOps::moveByClaim(dir.filePath("box"), dir.filePath("crate")));
+        QCOMPARE(read(dir.filePath("crate/inner/note.txt")), QByteArray("n"));
+        QVERIFY(!QFileInfo::exists(dir.filePath("box")));
+
+        // A link to a folder moves as the link it is, not as the folder it leads to.
+        QVERIFY(QFile::link(dir.filePath("crate"), dir.filePath("way")));
+        QVERIFY(FileOps::moveByClaim(dir.filePath("way"), dir.filePath("path")));
+        QVERIFY(QFileInfo(dir.filePath("path")).isSymLink());
+        QCOMPARE(QFileInfo(dir.filePath("path")).canonicalFilePath(), QFileInfo(dir.filePath("crate")).canonicalFilePath());
+        QVERIFY(!QFileInfo(dir.filePath("way")).isSymLink());
+        QCOMPARE(read(dir.filePath("crate/inner/note.txt")), QByteArray("n"));
+    }
+
     void fileOpsStopACopyOrAMovePartway()
     {
         // Stopped partway, a copy or move keeps what arrived and says it's part; a move leaves the rest where it was.
