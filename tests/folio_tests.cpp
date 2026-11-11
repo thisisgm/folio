@@ -451,6 +451,147 @@ private slots:
         QVERIFY(QFile::exists(from.filePath("box/z/2.txt")));
     }
 
+    void fileOpsCountWhatACopyWrites()
+    {
+        // A copy counts what it will write, then each block, and keeps what QFile::copy keeps; a rename writes nothing.
+        QTemporaryDir from, to;
+        write(from.filePath(".folio-test"), "");
+        write(to.filePath(".folio-test"), "");
+        QDir(from.path()).mkpath("album/empty");
+        // Three blocks and a little more.
+        const QByteArray big(3 * (1 << 20) + 5, 'x');
+        write(from.filePath("album/big.raw"), big);
+        write(from.filePath("album/.hidden"), "hi");
+        QVERIFY(QFile::link("big.raw", from.filePath("album/link")));
+        // A mode no new file has, executable and the group's, so only copying it gets it there.
+        const auto mode = QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner | QFile::ReadGroup | QFile::ExeGroup;
+        QVERIFY(QFile::setPermissions(from.filePath("album/big.raw"), mode));
+        const auto copyInto = [&](const QString &folder) {
+            FileOps::Progress progress;
+            QString error;
+            QCOMPARE(FileOps::transfer({from.filePath("album")}, folder, FileOps::Copy, &error, &progress), QStringList({"album"}));
+            QVERIFY2(error.isEmpty(), qPrintable(error));
+            QCOMPARE(progress.total.load(), big.size() + 2);
+            QCOMPARE(progress.done.load(), progress.total.load());
+            QFile copy(QDir(folder).filePath("album/big.raw"));
+            QVERIFY(copy.open(QIODevice::ReadOnly));
+            QCOMPARE(copy.readAll(), big);
+            QCOMPARE(copy.permissions(), QFile(from.filePath("album/big.raw")).permissions());
+            QCOMPARE(QFileInfo(QDir(folder).filePath("album/link")).readSymLink(), QString("big.raw"));
+            QCOMPARE(QDir(QDir(folder).filePath("album")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::Name),
+                     QStringList({".hidden", "big.raw", "empty", "link"}));
+        };
+        // On one drive it's a clone where the drive shares blocks (btrfs, XFS) and blocks where not (ext4, tmpfs): both count the same.
+        copyInto(to.path());
+        if (QTest::currentTestFailed())
+            return;
+
+        FileOps::Progress moving;
+        QString error;
+        QCOMPARE(FileOps::transfer({to.filePath("album")}, from.path(), FileOps::Move, &error, &moving), QStringList({"album (copy)"}));
+        QCOMPARE(moving.total.load(), 0);
+        QCOMPARE(moving.done.load(), 0);
+
+        // A clone never crosses drives, so from another drive it's blocks on every drive.
+        const auto other = elsewhere();
+        if (!other)
+            QSKIP("Needs a second drive.");
+        copyInto(other->path());
+    }
+
+    void fileOpsStopACopyOrAMovePartway()
+    {
+        // Stopped partway, a copy or move keeps what arrived and says it's part; a move leaves the rest where it was.
+        QTemporaryDir from, to;
+        write(from.filePath(".folio-test"), "");
+        write(to.filePath(".folio-test"), "");
+        QDir(from.path()).mkdir("box");
+        write(from.filePath("box/a.txt"), "a");
+        write(from.filePath("box/z.txt"), "z");
+        // A pipe holds the copy one block into a file, as a read waits for a whole block.
+        const QByteArray block(1 << 20, 'p');
+        const QByteArray pipe = QFile::encodeName(from.filePath("box/pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
+        const auto stopInThePipe = [&](const QString &folder, FileOps::Mode mode) {
+            FileOps::Progress progress;
+            QString error;
+            QFuture<QStringList> running = QtConcurrent::run([&] {
+                return FileOps::transfer({from.filePath("box")}, folder, mode, &error, &progress);
+            });
+            int writer = -1;
+            // Even when a check fails, the copy is let go of and finishes before what it uses is gone.
+            const auto finish = qScopeGuard([&] {
+                if (writer >= 0)
+                    close(writer);
+                running.waitForFinished();
+            });
+            if (QTest::qWaitFor([&] { return (writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK)) >= 0; })
+                && fcntl(writer, F_SETFL, 0) == 0 && ::write(writer, block.constData(), block.size()) == block.size()
+                && QTest::qWaitFor([&] { return progress.done == 1 + block.size(); })) {
+                progress.stop = true;
+                // Stopped, the copy takes no more of the pipe than it has.
+                if (::write(writer, "rest", 4) != 4)
+                    return qMakePair(QStringList(), QString("couldn't write to the pipe"));
+            }
+            close(std::exchange(writer, -1));
+            const QStringList made = running.result();
+            return qMakePair(made, error);
+        };
+        QCOMPARE(stopInThePipe(to.path(), FileOps::Copy),
+                 qMakePair(QStringList({"box"}), QString("Stopped partway: only part of box was copied.")));
+        QCOMPARE(QDir(to.filePath("box")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System),
+                 QStringList({"a.txt"}));
+        QCOMPARE(QDir(from.filePath("box")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::System, QDir::Name),
+                 QStringList({"a.txt", "pipe", "z.txt"}));
+
+        const auto other = elsewhere();
+        if (!other)
+            QSKIP("Needs a second drive.");
+        QCOMPARE(stopInThePipe(other->path(), FileOps::Move),
+                 qMakePair(QStringList({"box"}),
+                           QString("Stopped partway: only part of box was moved, and the rest is still in %1.").arg(from.path())));
+        QCOMPARE(QDir(other->filePath("box")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System),
+                 QStringList({"a.txt"}));
+        QCOMPARE(QDir(from.filePath("box")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::System, QDir::Name),
+                 QStringList({"pipe", "z.txt"}));
+    }
+
+    void fileOpsShowACopysProgressAndStopIt()
+    {
+        // The window sees a copy's bytes and stops it; stopped before its only file was written, nothing is left.
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        const QByteArray pipe = QFile::encodeName(dir.filePath("pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
+        FileOps ops;
+        QSignalSpy failed(&ops, &FileOps::failed);
+        QVERIFY(!ops.canStop());
+        ops.duplicate(dir.filePath("pipe"));
+        QVERIFY(ops.canStop());
+        int writer = -1;
+        const auto finish = qScopeGuard([&] {
+            if (writer >= 0)
+                close(writer);
+            QTRY_VERIFY(ops.busy().isEmpty());
+        });
+        QVERIFY(QTest::qWaitFor([&] { return (writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK)) >= 0; }));
+        // One block in, as a read waits for a whole one.
+        const QByteArray block(1 << 20, 'p');
+        QCOMPARE(fcntl(writer, F_SETFL, 0), 0);
+        QCOMPARE(::write(writer, block.constData(), block.size()), block.size());
+        QTRY_COMPARE(ops.bytesDone(), block.size());
+        QCOMPARE(ops.busy(), QString("Duplicating pipe…"));
+        ops.stop();
+        QCOMPARE(::write(writer, "rest", 4), 4);
+        close(std::exchange(writer, -1));
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(failed.first().first().toString(), QString("Stopped before pipe was copied."));
+        QVERIFY(!ops.canStop());
+        QCOMPARE(ops.bytesDone(), 0);
+        QCOMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::Name),
+                 QStringList({".folio-test", "pipe"}));
+    }
+
     void fileOpsCopyLinksAsWritten()
     {
         // A link relative to its folder points into the copy, not back at

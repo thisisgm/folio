@@ -4,8 +4,11 @@
 #include <QObject>
 #include <QStringList>
 #include <QUrl>
+#include <QTimer>
 #include <QVariantList>
+#include <atomic>
 #include <functional>
+#include <memory>
 
 class QMimeData;
 class QProcess;
@@ -19,12 +22,27 @@ class FileOps : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(bool canPaste READ canPaste NOTIFY clipboardChanged)
+    // A copy or move under way: bytes copied of how many, and whether it can be stopped.
+    Q_PROPERTY(qint64 bytesDone READ bytesDone NOTIFY progressChanged)
+    Q_PROPERTY(qint64 bytesTotal READ bytesTotal NOTIFY progressChanged)
+    Q_PROPERTY(bool canStop READ canStop NOTIFY progressChanged)
 
 public:
     explicit FileOps(QObject *parent = nullptr);
 
     QString busy() const { return m_busy; }
     bool canPaste() const;
+    qint64 bytesDone() const { return m_bytesDone; }
+    qint64 bytesTotal() const { return m_bytesTotal; }
+    bool canStop() const { return m_canStop; }
+
+    // What a copy on another thread shares with the window: bytes copied, bytes to copy, and whether to stop.
+    struct Progress {
+        std::atomic<qint64> done{0}, total{0};
+        std::atomic_bool stop{false};
+    };
+    // Stops the copy or move under way at its next block: what arrived stays, the file being written goes.
+    Q_INVOKABLE void stop();
 
     // The clipboard holds files the way GNOME and KDE apps expect
     // (x-special/gnome-copied-files plus text/uri-list), and their paths as
@@ -104,7 +122,8 @@ public:
     // Copies `from` to `to`, a folder with all it holds. Moving, each file
     // is removed once it's copied and each folder once it's empty; what
     // can't be removed is left where it is.
-    static bool copyRecursively(const QString &from, const QString &to, QString *error, bool move = false);
+    static bool copyRecursively(const QString &from, const QString &to, QString *error, bool move = false,
+                                Progress *progress = nullptr);
     // The archive name for compressing these into `folder`: "name.zip" for
     // one item, "Archive.zip" for several; never one that exists.
     static QString archiveName(const QStringList &paths, const QString &folder);
@@ -125,11 +144,13 @@ public:
     // them, each moved from the folder's drive and copied from any other.
     enum Mode { Copy, Move, Drop };
     // Copies or moves each path into `folder`; returns the new names.
-    static QStringList transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error);
+    static QStringList transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error,
+                                Progress *progress = nullptr);
 
 signals:
     void busyChanged();
     void clipboardChanged();
+    void progressChanged();
     void failed(const QString &message);
     void notice(const QString &notice);
     // Work finished in `folder`, which now holds `name` (to select it).
@@ -159,5 +180,12 @@ private:
     void startTool(QProcess *process, const QString &program, const QStringList &args, const QString &busy,
                    const QString &missing, const std::function<void(QProcess *, int)> &finished);
 
+    // Reads the copy under way's counts for the window.
+    void readProgress();
+
     QString m_busy;
+    std::shared_ptr<Progress> m_progress;
+    QTimer m_progressTimer;
+    qint64 m_bytesDone = 0, m_bytesTotal = 0;
+    bool m_canStop = false;
 };

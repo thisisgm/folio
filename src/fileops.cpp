@@ -2,6 +2,7 @@
 
 #include <QClipboard>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGuiApplication>
@@ -13,9 +14,13 @@
 #include <QStorageInfo>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QThreadPool>
 #include <QUrl>
 #include <QtConcurrent>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <clocale>
 
@@ -26,9 +31,16 @@
 #include <gio/gio.h>
 #define signals Q_SIGNALS
 
+// How often the window reads a copy's counts: ten times a second.
+static constexpr int kProgressMs = 100;
+// A copy's block: big enough to keep a drive busy, small enough for Stop and the count to move within a file.
+static constexpr qint64 kBlock = 1 << 20;
+
 FileOps::FileOps(QObject *parent) : QObject(parent) {
     if (auto *clipboard = QGuiApplication::clipboard())
         connect(clipboard, &QClipboard::dataChanged, this, &FileOps::clipboardChanged);
+    m_progressTimer.setInterval(kProgressMs);
+    connect(&m_progressTimer, &QTimer::timeout, this, &FileOps::readProgress);
 }
 
 QMimeData *FileOps::mimeDataFor(const QStringList &paths, bool cut) {
@@ -114,7 +126,57 @@ QString FileOps::freeName(const QString &folder, const QString &name) {
     }
 }
 
-bool FileOps::copyRecursively(const QString &from, const QString &to, QString *error, bool move) {
+// QFile::copy a block at a time, counted and stoppable: under a hidden name, then renamed without overwriting.
+static bool copyFile(const QString &from, const QString &to, FileOps::Progress *progress) {
+    if (QFileInfo::exists(to))
+        return false;
+    QFile in(from);
+    QTemporaryFile out(QFileInfo(to).absolutePath() + "/.folio-copy-XXXXXX");
+    if (!in.open(QIODevice::ReadOnly) || !out.open())
+        return false;
+    // Where the drive shares blocks (btrfs, XFS), the copy is instant.
+    if (::ioctl(out.handle(), FICLONE, in.handle()) == 0) {
+        progress->done += in.size();
+    } else {
+        QByteArray block(kBlock, Qt::Uninitialized);
+        qint64 written = 0;
+        for (qint64 got; (got = in.read(block.data(), block.size())) != 0; written += got) {
+            if (got < 0 || progress->stop || out.write(block.constData(), got) != got || !out.flush())
+                return false;
+            progress->done += got;
+            // Waits for the block before, so the count leads the drive by one block, not gigabytes of cache.
+            ::sync_file_range(out.handle(), written, got, SYNC_FILE_RANGE_WRITE);
+            if (written > 0)
+                ::sync_file_range(out.handle(), written - kBlock, kBlock,
+                                  SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+        }
+    }
+    if (!out.flush() || !out.rename(to))
+        return false;
+    out.setAutoRemove(false);
+    QFile::setPermissions(to, in.permissions());
+    return true;
+}
+
+// The bytes copying `path` writes: its size, or all its files' sizes; links are made again, not copied.
+static qint64 bytesIn(const QString &path, const FileOps::Progress &progress) {
+    const QFileInfo info(path);
+    if (info.isSymLink() || !info.isDir())
+        return info.isFile() && !info.isSymLink() ? info.size() : 0;
+    qint64 bytes = 0;
+    QDirIterator it(path, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDirIterator::Subdirectories);
+    while (it.hasNext() && !progress.stop) {
+        const QFileInfo entry = it.nextFileInfo();
+        if (entry.isFile() && !entry.isSymLink())
+            bytes += entry.size();
+    }
+    return bytes;
+}
+
+bool FileOps::copyRecursively(const QString &from, const QString &to, QString *error, bool move, Progress *progress) {
+    // transfer() says what a stop left, so there's no error here.
+    if (progress && progress->stop)
+        return false;
     const QFileInfo info(from);
     if (info.isSymLink()) {
         // Links are copied as links, not followed, and as written: one
@@ -128,7 +190,7 @@ bool FileOps::copyRecursively(const QString &from, const QString &to, QString *e
         return true;
     }
     if (!info.isDir()) {
-        if (!QFile::copy(from, to)) {
+        if (!(progress ? copyFile(from, to, progress) : QFile::copy(from, to))) {
             *error = QObject::tr("Couldn't copy %1.").arg(info.fileName());
             return false;
         }
@@ -152,7 +214,7 @@ bool FileOps::copyRecursively(const QString &from, const QString &to, QString *e
     const QDir source(from);
     const auto entries = source.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System);
     for (const QFileInfo &entry : entries)
-        if (!copyRecursively(entry.filePath(), QDir(to).filePath(entry.fileName()), error, move))
+        if (!copyRecursively(entry.filePath(), QDir(to).filePath(entry.fileName()), error, move, progress))
             return false;
     QFile::setPermissions(to, info.permissions());
     // Only once it's empty: what turned up in it while the rest moved was
@@ -205,10 +267,16 @@ static bool inside(const QString &folder, const QString &path) {
     return item.isDir() && !item.isSymLink() && (target == self || target.startsWith(self + '/'));
 }
 
-QStringList FileOps::transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error) {
+QStringList FileOps::transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error, Progress *progress) {
     QStringList made;
     const QString target = QDir::cleanPath(folder);
-    for (const QString &path : outermost(paths)) {
+    const QStringList items = outermost(paths);
+    // Counted first, to say how much of how much; a move on one drive is a rename and writes nothing.
+    if (progress)
+        for (const QString &path : items)
+            if (!((mode == Move || mode == Drop) && sameDrive(path, target)))
+                progress->total += bytesIn(path, *progress);
+    for (const QString &path : items) {
         const QFileInfo info(path);
         if (!info.exists() && !info.isSymLink()) {
             *error = QObject::tr("%1 is no longer there.").arg(info.fileName());
@@ -218,6 +286,11 @@ QStringList FileOps::transfer(const QStringList &paths, const QString &folder, M
         // Moving something into the folder it's already in does nothing.
         if (move && QDir::cleanPath(info.absolutePath()) == target)
             continue;
+        if (progress && progress->stop) {
+            *error = move ? QObject::tr("Stopped before %1 was moved.").arg(info.fileName())
+                          : QObject::tr("Stopped before %1 was copied.").arg(info.fileName());
+            break;
+        }
         if (inside(target, path)) {
             *error = QObject::tr("Can't put %1 inside itself.").arg(info.fileName());
             break;
@@ -232,12 +305,23 @@ QStringList FileOps::transfer(const QStringList &paths, const QString &folder, M
             made << name;
             continue;
         }
-        if (!copyRecursively(path, destination, error, move)) {
+        // A rename that didn't happen copies what wasn't counted.
+        if (progress && move && sameDrive(path, target))
+            progress->total += bytesIn(path, *progress);
+        if (!copyRecursively(path, destination, error, move, progress)) {
+            // A stopped copy is shown and said to be part too, so it isn't taken for whole.
+            const bool stopped = progress && progress->stop;
             // Each original went as it was copied, so what arrived is now the
             // only copy of it: it's shown, and said to be only part.
-            if (move && QFileInfo::exists(destination)) {
+            if ((move || stopped) && QFileInfo::exists(destination)) {
                 made << name;
-                *error = QObject::tr("Moved only part of %1: %2").arg(info.fileName(), *error);
+                *error = !stopped ? QObject::tr("Moved only part of %1: %2").arg(info.fileName(), *error)
+                       : move     ? QObject::tr("Stopped partway: only part of %1 was moved, and the rest is still in %2.")
+                                    .arg(info.fileName(), info.absolutePath())
+                                  : QObject::tr("Stopped partway: only part of %1 was copied.").arg(info.fileName());
+            } else if (stopped) {
+                *error = move ? QObject::tr("Stopped before %1 was moved.").arg(info.fileName())
+                              : QObject::tr("Stopped before %1 was copied.").arg(info.fileName());
             }
             break;
         }
@@ -333,14 +417,22 @@ void FileOps::transferInBackground(const QStringList &paths, const QString &fold
     const QString showing = !busy.isEmpty() ? busy
                             : moving        ? tr("Moving %n items…", "", paths.size())
                                             : tr("Copying %n items…", "", paths.size());
+    // The copy only writes `progress` and keeps it while it runs; the window reads it on a timer.
+    auto progress = std::make_shared<Progress>();
+    m_progress = progress;
+    m_progressTimer.start();
+    readProgress();
     inBackground(
         showing,
-        [paths, folder, mode] {
+        [paths, folder, mode, progress] {
             QString error;
-            const QStringList made = transfer(paths, folder, mode, &error);
+            const QStringList made = transfer(paths, folder, mode, &error, progress.get());
             return qMakePair(made, error);
         },
         [this, paths, folder, releaseClipboard](const QPair<QStringList, QString> &result) {
+            m_progress.reset();
+            m_progressTimer.stop();
+            readProgress();
             const auto &[made, error] = result;
             // Only the cut that was pasted is let go of; something copied
             // while it moved stays on the clipboard.
@@ -883,6 +975,21 @@ void FileOps::startTool(QProcess *process, const QString &program, const QString
         emit failed(missing);
     });
     process->start(program, args);
+}
+
+void FileOps::stop() {
+    if (m_progress)
+        m_progress->stop = true;
+}
+
+void FileOps::readProgress() {
+    const qint64 done = m_progress ? m_progress->done.load() : 0, total = m_progress ? m_progress->total.load() : 0;
+    if (done == m_bytesDone && total == m_bytesTotal && m_canStop == !!m_progress)
+        return;
+    m_bytesDone = done;
+    m_bytesTotal = total;
+    m_canStop = !!m_progress;
+    emit progressChanged();
 }
 
 bool FileOps::idle() {
