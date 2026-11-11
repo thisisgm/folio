@@ -523,7 +523,7 @@ private slots:
         QDir(from.path()).mkdir("box");
         write(from.filePath("box/a.txt"), "a");
         write(from.filePath("box/z.txt"), "z");
-        // A pipe holds the copy one block into a file, as a read waits for a whole block.
+        // A pipe holds the copy one block into a file: its writer is still there, so the copy waits for more.
         const QByteArray block(1 << 20, 'p');
         const QByteArray pipe = QFile::encodeName(from.filePath("box/pipe"));
         QVERIFY(mkfifo(pipe.constData(), 0600) == 0);
@@ -544,9 +544,9 @@ private slots:
                 && fcntl(writer, F_SETFL, 0) == 0 && ::write(writer, block.constData(), block.size()) == block.size()
                 && QTest::qWaitFor([&] { return progress.done == 1 + block.size(); })) {
                 progress.stop = true;
-                // Stopped, the copy takes no more of the pipe than it has.
-                if (::write(writer, "rest", 4) != 4)
-                    return qMakePair(QStringList(), QString("couldn't write to the pipe"));
+                // Stopped, the copy lets go of the pipe though its writer has neither written more nor left.
+                if (!QTest::qWaitFor([&] { return running.isFinished(); }))
+                    return qMakePair(QStringList(), QString("the copy went on waiting for the pipe"));
             }
             close(std::exchange(writer, -1));
             const QStringList made = running.result();
@@ -571,6 +571,38 @@ private slots:
                  QStringList({"pipe", "z.txt"}));
     }
 
+    void fileOpsMoveAPipeWithinItsDriveAsItIs()
+    {
+        // The copy a move takes when its rename is refused carries a pipe across as a pipe, within one drive: read, it would wait for a writer who may never come.
+        QTemporaryDir from, to;
+        QDir(from.path()).mkdir("box");
+        write(from.filePath("box/a.txt"), "a");
+        const QByteArray pipe = QFile::encodeName(from.filePath("box/pipe"));
+        QVERIFY(mkfifo(pipe.constData(), 0640) == 0);
+        FileOps::Progress progress;
+        QString error;
+        QFuture<bool> moved = QtConcurrent::run([&] {
+            return FileOps::copyRecursively(from.filePath("box"), to.filePath("box"), &error, true, &progress);
+        });
+        // Even when a check fails, a move waiting on the pipe is let go of before what it uses is gone.
+        const auto finish = qScopeGuard([&] {
+            const int writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK);
+            if (writer >= 0)
+                close(writer);
+            moved.waitForFinished();
+        });
+        QTRY_VERIFY(moved.isFinished());
+        QVERIFY2(moved.result(), qPrintable(error));
+        struct stat arrived;
+        QCOMPARE(lstat(QFile::encodeName(to.filePath("box/pipe")).constData(), &arrived), 0);
+        QVERIFY(S_ISFIFO(arrived.st_mode));
+        QCOMPARE(int(arrived.st_mode & 0777), 0640);
+        QCOMPARE(QDir(to.filePath("box")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::System, QDir::Name),
+                 QStringList({"a.txt", "pipe"}));
+        QVERIFY(!QFileInfo::exists(from.filePath("box")));
+        QCOMPARE(progress.done.load(), 1);
+    }
+
     void fileOpsShowACopysProgressAndStopIt()
     {
         // The window sees a copy's bytes and stops it; stopped before its only file was written, nothing is left.
@@ -590,16 +622,16 @@ private slots:
             QTRY_VERIFY(ops.busy().isEmpty());
         });
         QVERIFY(QTest::qWaitFor([&] { return (writer = open(pipe.constData(), O_WRONLY | O_NONBLOCK)) >= 0; }));
-        // One block in, as a read waits for a whole one.
+        // One block in, and the writer stays, so the copy waits for more.
         const QByteArray block(1 << 20, 'p');
         QCOMPARE(fcntl(writer, F_SETFL, 0), 0);
         QCOMPARE(::write(writer, block.constData(), block.size()), block.size());
         QTRY_COMPARE(ops.bytesDone(), block.size());
         QCOMPARE(ops.busy(), QString("Duplicating pipe…"));
         ops.stop();
-        QCOMPARE(::write(writer, "rest", 4), 4);
-        close(std::exchange(writer, -1));
+        // Stop needs nothing more from the pipe: its writer is still there when the copy ends.
         QTRY_COMPARE(failed.count(), 1);
+        close(std::exchange(writer, -1));
         QCOMPARE(failed.first().first().toString(), QString("Stopped before pipe was copied."));
         QVERIFY(!ops.canStop());
         QCOMPARE(ops.bytesDone(), 0);

@@ -20,8 +20,10 @@
 #include <QtConcurrent>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <cerrno>
 #include <clocale>
 #include <cstdio>
 
@@ -36,6 +38,8 @@
 static constexpr int kProgressMs = 100;
 // A copy's block: big enough to keep a drive busy, small enough for Stop and the count to move within a file.
 static constexpr qint64 kBlock = 1 << 20;
+// How long a copy waits on a source with nothing to read yet (a pipe nobody is writing to) before it looks at Stop again.
+static constexpr int kStopCheckMs = 100;
 
 FileOps::FileOps(QObject *parent) : QObject(parent) {
     if (auto *clipboard = QGuiApplication::clipboard())
@@ -131,25 +135,41 @@ QString FileOps::freeName(const QString &folder, const QString &name) {
 static bool copyFile(const QString &from, const QString &to, FileOps::Progress *progress) {
     if (QFileInfo::exists(to))
         return false;
-    QFile in(from);
+    QFile in;
     QTemporaryFile out(QFileInfo(to).absolutePath() + "/.folio-copy-XXXXXX");
-    if (!in.open(QIODevice::ReadOnly) || !out.open())
+    // Opened without waiting: a pipe nobody writes to would hold a plain open, and then a read, where Stop can't reach.
+    const int source = ::open(QFile::encodeName(from).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (source < 0 || !in.open(source, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle) || !out.open())
         return false;
     // Where the drive shares blocks (btrfs, XFS), the copy is instant.
     if (::ioctl(out.handle(), FICLONE, in.handle()) == 0) {
         progress->done += in.size();
     } else {
         QByteArray block(kBlock, Qt::Uninitialized);
-        qint64 written = 0;
-        for (qint64 got; (got = in.read(block.data(), block.size())) != 0; written += got) {
-            if (got < 0 || progress->stop || out.write(block.constData(), got) != got || !out.flush())
+        qint64 written = 0, before = 0;
+        for (;;) {
+            // A file always has its next block; a pipe with nothing in it yet is waited on a little at a time, with Stop read in between.
+            pollfd waiting{source, POLLIN, 0};
+            const int ready = ::poll(&waiting, 1, kStopCheckMs);
+            if (progress->stop || (ready < 0 && errno != EINTR))
+                return false;
+            if (ready <= 0)
+                continue;
+            const qint64 got = ::read(source, block.data(), block.size());
+            if (got == 0)
+                break;
+            if (got < 0 && (errno == EAGAIN || errno == EINTR))
+                continue;
+            if (got < 0 || out.write(block.constData(), got) != got || !out.flush())
                 return false;
             progress->done += got;
             // Waits for the block before, so the count leads the drive by one block, not gigabytes of cache.
             ::sync_file_range(out.handle(), written, got, SYNC_FILE_RANGE_WRITE);
             if (written > 0)
-                ::sync_file_range(out.handle(), written - kBlock, kBlock,
+                ::sync_file_range(out.handle(), written - before, before,
                                   SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+            written += got;
+            before = got;
         }
     }
     if (!out.flush() || !out.rename(to))
@@ -191,10 +211,13 @@ bool FileOps::copyRecursively(const QString &from, const QString &to, QString *e
         return true;
     }
     if (!info.isDir()) {
-        if (!(progress ? copyFile(from, to, progress) : QFile::copy(from, to))) {
+        // A pipe, a socket or a device moved within its drive is linked across, as the refused rename would have carried it; anywhere else it's read like a file.
+        const bool carried = move && !info.isFile() && ::link(QFile::encodeName(from).constData(), QFile::encodeName(to).constData()) == 0;
+        if (!carried && !(progress ? copyFile(from, to, progress) : QFile::copy(from, to))) {
             *error = QObject::tr("Couldn't copy %1.").arg(info.fileName());
             return false;
         }
+        // Linked or copied, the original then goes by its name, as for every file this copies (nothing removes a name only while it's still the same file); one that stays is the caller's to report.
         if (move)
             QFile::remove(from);
         return true;
@@ -332,6 +355,7 @@ QStringList FileOps::transfer(const QStringList &paths, const QString &folder, M
             break;
         }
         made << name;
+        // copyRecursively doesn't say when an original couldn't be removed: it's looked for here.
         const QFileInfo left(path);
         if (move && (left.exists() || left.isSymLink())) {
             *error = QObject::tr("Copied %1, but couldn't remove the original.").arg(info.fileName());
