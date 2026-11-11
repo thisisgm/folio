@@ -21,9 +21,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <cerrno>
 #include <clocale>
 #include <cstdio>
 
@@ -270,32 +268,9 @@ static bool inside(const QString &folder, const QString &path) {
     return item.isDir() && !item.isSymLink() && (target == self || target.startsWith(self + '/'));
 }
 
-// A rename for a drive that can't promise not to replace: a file or a link is hard-linked under its new name, a folder takes the place of an empty one made for it.
-bool FileOps::moveByClaim(const QString &from, const QString &to) {
-    const QByteArray source = QFile::encodeName(from), target = QFile::encodeName(to);
-    const QFileInfo item(from);
-    if (!item.isDir() || item.isSymLink()) {
-        if (::link(source.constData(), target.constData()) != 0)
-            return false;
-        if (::unlink(source.constData()) == 0)
-            return true;
-        ::unlink(target.constData());
-        return false;
-    }
-    if (::mkdir(target.constData(), S_IRWXU) != 0)
-        return false;
-    if (::rename(source.constData(), target.constData()) == 0)
-        return true;
-    ::rmdir(target.constData());
-    return false;
-}
-
-// A rename and nothing more. QFile::rename copies a file itself where a rename can't reach, uncounted and unstoppable.
+// A rename and nothing more, never onto a name that's taken. QFile::rename copies a file itself where a rename can't reach, uncounted and unstoppable.
 static bool renameOnly(const QString &from, const QString &to) {
-    if (::renameat2(AT_FDCWD, QFile::encodeName(from).constData(), AT_FDCWD, QFile::encodeName(to).constData(), RENAME_NOREPLACE) == 0)
-        return true;
-    // EINVAL is a drive that takes no such flag (NFS, some network mounts): a plain rename there would replace what another just made.
-    return errno == EINVAL && FileOps::moveByClaim(from, to);
+    return ::renameat2(AT_FDCWD, QFile::encodeName(from).constData(), AT_FDCWD, QFile::encodeName(to).constData(), RENAME_NOREPLACE) == 0;
 }
 
 QStringList FileOps::transfer(const QStringList &paths, const QString &folder, Mode mode, QString *error, Progress *progress) {
@@ -336,7 +311,7 @@ QStringList FileOps::transfer(const QStringList &paths, const QString &folder, M
             made << name;
             continue;
         }
-        // A rename that didn't happen copies what wasn't counted.
+        // A refused rename is copied, whatever refused it (another drive, or one that can't rename without replacing: NFS, some FUSE mounts); on one drive that copy wasn't counted yet.
         if (progress && move && sameDrive(path, target))
             progress->total += bytesIn(path, *progress);
         if (!copyRecursively(path, destination, error, move, progress)) {
