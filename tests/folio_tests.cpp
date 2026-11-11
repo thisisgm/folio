@@ -1,6 +1,7 @@
 #include <QClipboard>
 #include <QDir>
 #include <QMimeData>
+#include <QMimeDatabase>
 #include <memory>
 #include <QFile>
 #include <QGuiApplication>
@@ -14,6 +15,8 @@
 #include <QUrl>
 #include <QtConcurrent>
 #include <QtTest>
+#include <cerrno>
+#include <clocale>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -628,6 +631,209 @@ private slots:
         QCOMPARE(names, QStringList({"Archive (copy).zip", "Archive.zip"}));
         QCOMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden, QDir::Name),
                  QStringList({"Archive (copy).zip", "Archive.zip", "a.txt", "b.txt", "c.txt"}));
+    }
+
+    void fileOpsExtractIntoAFolderBeside()
+    {
+        // An archive unpacks as it is into a folder named after it, beside it; a taken name gets "(copy)", never a merge.
+        if (QStandardPaths::findExecutable("bsdtar").isEmpty())
+            QSKIP("Extracting needs bsdtar.");
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        const QString top = "-my 'odd' ñ";
+        QDir(dir.path()).mkpath("src/" + top);
+        write(dir.filePath("src/" + top + "/\"quoted\" día.txt"), "hola");
+        const QString archive = dir.filePath(top + ".tar.gz");
+        QCOMPARE(QProcess::execute("bsdtar", {"-a", "-cf", archive, "-C", dir.filePath("src"), "--", top}), 0);
+        FileOps ops;
+        QSignalSpy done(&ops, &FileOps::done), failed(&ops, &FileOps::failed);
+        ops.extract(archive);
+        QCOMPARE(ops.busy(), QString("Extracting %1.tar.gz…").arg(top));
+        QVERIFY(done.wait(5000));
+        QCOMPARE(done.last(), QVariantList({dir.path(), top}));
+        QFile file(dir.filePath(top + "/" + top + "/\"quoted\" día.txt"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), QByteArray("hola"));
+        ops.extract(archive);
+        QVERIFY(done.wait(5000));
+        QCOMPARE(done.last(), QVariantList({dir.path(), top + " (copy)"}));
+        QVERIFY(QFile::exists(dir.filePath(top + " (copy)/" + top + "/\"quoted\" día.txt")));
+        QVERIFY(failed.isEmpty());
+        // They get a new folder's permissions, and nothing they were unpacked in is left beside them.
+        QVERIFY(QDir(dir.path()).mkdir("usual"));
+        QCOMPARE(QFileInfo(dir.filePath(top)).permissions(), QFileInfo(dir.filePath("usual")).permissions());
+        QTRY_COMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden, QDir::Name),
+                     QStringList({top, top + " (copy)", top + ".tar.gz", ".folio-test", "src", "usual"}));
+    }
+
+    void fileOpsExtractOnlyArchives()
+    {
+        // bsdtar unpacks archives, not a lone compressed file, so Extract isn't offered for notes.txt.gz.
+        const auto offered = [](const char *name) {
+            return FileOps::canExtract(QMimeDatabase().mimeTypeForFile(name, QMimeDatabase::MatchExtension).name());
+        };
+        for (const char *name : {"a.zip", "a.tar", "a.tar.gz", "a.tgz", "a.tar.xz", "a.tar.bz2", "a.tar.zst", "a.7z", "a.rar", "a.cpio"})
+            QVERIFY2(offered(name), name);
+        for (const char *name : {"notes.txt.gz", "notes.txt.xz", "notes.txt.zst", "notes.txt", "a.pdf"})
+            QVERIFY2(!offered(name), name);
+    }
+
+    void fileOpsExtractLeavesNothingWhenItFails()
+    {
+        // Nothing looks finished until it's done, and a failed run takes only what it unpacked, not a folder made meanwhile.
+        if (QStandardPaths::findExecutable("bsdtar").isEmpty())
+            QSKIP("Extracting needs bsdtar.");
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        QDir(dir.path()).mkpath("src/via/link");
+        QDir(dir.path()).mkpath("outside");
+        write(dir.filePath("outside/kept.txt"), "kept");
+        write(dir.filePath("src/encryption.md"), "x");
+        write(dir.filePath("src/via/link/pwn"), "x");
+        QVERIFY(QFile::link(dir.filePath("outside"), dir.filePath("src/link")));
+        // Entries "../encryption.md", then "link" to the folder outside and "link/pwn" written through it.
+        const QString archive = dir.filePath("evil.tar");
+        QCOMPARE(QProcess::execute("bsdtar", {"-P", "-cf", archive, "-s", ",^encryption.md$,../encryption.md,", "-C",
+                                              dir.filePath("src"), "encryption.md", "link", "-C", dir.filePath("src/via"), "link/pwn"}),
+                 0);
+        FileOps ops;
+        QSignalSpy failed(&ops, &FileOps::failed);
+        ops.extract(archive);
+        QCOMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::Name),
+                 QStringList({"evil.tar", "outside", "src"}));
+        QVERIFY(QDir(dir.path()).mkdir("evil"));
+        write(dir.filePath("evil/mine.txt"), "mine");
+        QVERIFY(failed.wait(5000));
+        // Said as bsdtar says it: the entry's name is no password problem.
+        QCOMPARE(failed.last().at(0).toString(), QString("Couldn't extract evil.tar: ../encryption.md: Path contains '..'"));
+        QCOMPARE(ops.busy(), QString());
+        QVERIFY(!QFileInfo::exists(dir.filePath("encryption.md")));
+        QVERIFY(!QFileInfo::exists(dir.filePath("outside/pwn")));
+        QVERIFY(QFile::exists(dir.filePath("outside/kept.txt")));
+        QVERIFY(QFile::exists(dir.filePath("evil/mine.txt")));
+        QCOMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden, QDir::Name),
+                 QStringList({".folio-test", "evil", "evil.tar", "outside", "src"}));
+    }
+
+    void fileOpsExtractSaysWhatsWrong()
+    {
+        // A password, a crash, bsdtar missing and a read-only folder each fail at once, say so, and leave nothing.
+        if (QStandardPaths::findExecutable("bsdtar").isEmpty())
+            QSKIP("Extracting needs bsdtar.");
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        write(dir.filePath("plans.txt"), "secret");
+        const QString archive = dir.filePath("plans.zip");
+        QCOMPARE(QProcess::execute("bsdtar", {"--format", "zip", "--options", "zip:encryption=zipcrypt", "--passphrase",
+                                              "sesame", "-cf", archive, "-C", dir.path(), "plans.txt"}),
+                 0);
+        FileOps ops;
+        QSignalSpy failed(&ops, &FileOps::failed);
+        ops.extract(archive);
+        QVERIFY(failed.wait(5000));
+        QCOMPARE(failed.last().at(0).toString(), QString("Couldn't extract plans.zip: it's protected by a password."));
+
+        // A bsdtar that crashes says nothing, and the sentence still ends.
+        const QString bin = dir.filePath("bin");
+        QVERIFY(QDir().mkdir(bin));
+        write(bin + "/bsdtar", "#!/bin/sh\nkill -KILL $$\n");
+        QVERIFY(QFile::setPermissions(bin + "/bsdtar", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        const QByteArray path = qgetenv("PATH");
+        auto restore = qScopeGuard([path] { qputenv("PATH", path); });
+        qputenv("PATH", QFile::encodeName(bin));
+        ops.extract(archive);
+        QVERIFY(failed.wait(5000));
+        QCOMPARE(failed.last().at(0).toString(), QString("Couldn't extract plans.zip."));
+        QVERIFY(QFile::remove(bin + "/bsdtar"));
+        ops.extract(archive);
+        QVERIFY(failed.wait(5000));
+        QCOMPARE(failed.last().at(0).toString(), QString("Extracting needs bsdtar, from the libarchive package."));
+        restore.dismiss();
+        qputenv("PATH", path);
+        QTRY_COMPARE(QDir(dir.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden, QDir::Name),
+                     QStringList({".folio-test", "bin", "plans.txt", "plans.zip"}));
+
+        if (geteuid() == 0)
+            QSKIP("Root can write in a read-only folder.");
+        QVERIFY(QDir().mkdir(dir.filePath("locked")));
+        QVERIFY(QFile::copy(archive, dir.filePath("locked/plans.zip")));
+        QVERIFY(QFile::setPermissions(dir.filePath("locked"), QFile::ReadOwner | QFile::ExeOwner));
+        const auto unlock = qScopeGuard([&] { QFile::setPermissions(dir.filePath("locked"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner); });
+        ops.extract(dir.filePath("locked/plans.zip"));
+        QCOMPARE(failed.last().at(0).toString(), "Couldn't extract plans.zip: " + qt_error_string(EACCES));
+        QCOMPARE(QDir(dir.filePath("locked")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden), QStringList({"plans.zip"}));
+    }
+
+    void fileOpsExtractReadsBsdtarInC()
+    {
+        // bsdtar's messages come in C under any locale, so a password still reads as one; names keep the user's characters.
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        write(dir.filePath("plans.zip"), "");
+        const QString bin = dir.filePath("bin");
+        QVERIFY(QDir().mkdir(bin));
+        const QByteArray path = qgetenv("PATH");
+        const QList<QByteArray> names{"LC_ALL", "LC_MESSAGES", "LC_CTYPE"};
+        QList<QByteArray> was;
+        for (const QByteArray &name : names)
+            was << qgetenv(name.constData());
+        const auto restore = qScopeGuard([&] {
+            qputenv("PATH", path);
+            for (int i = 0; i < names.size(); ++i)
+                was[i].isNull() ? qunsetenv(names[i].constData()) : qputenv(names[i].constData(), was[i]);
+        });
+        qputenv("PATH", QFile::encodeName(bin));
+        for (const QByteArray &name : names)
+            qputenv(name.constData(), "de_DE.UTF-8");
+        const auto standIn = [&](const QByteArray &script) {
+            write(bin + "/bsdtar", "#!/bin/sh\n" + script + "exit 1\n");
+            QVERIFY(QFile::setPermissions(bin + "/bsdtar", QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        };
+        FileOps ops;
+        QSignalSpy failed(&ops, &FileOps::failed);
+        // As bsdtar 3.8 says it for a locked zip: in German unless its messages are C.
+        standIn("if [ -z \"${LC_ALL-}\" ] && [ \"${LC_MESSAGES-}\" = C ]; then e='Unknown error -1'; else e='Unbekannter Fehler -1'; fi\n"
+                "printf 'Enter passphrase:plans.txt: Too many incorrect passphrases: %s\\n' \"$e\" >&2\n");
+        ops.extract(dir.filePath("plans.zip"));
+        QVERIFY(failed.wait(5000));
+        QCOMPARE(failed.last().at(0).toString(), QString("Couldn't extract plans.zip: it's protected by a password."));
+        standIn("echo \"plans.txt: LC_ALL=${LC_ALL-unset} LC_MESSAGES=${LC_MESSAGES-unset} LC_CTYPE=${LC_CTYPE-unset}\" >&2\n");
+        ops.extract(dir.filePath("plans.zip"));
+        QVERIFY(failed.wait(5000));
+        QCOMPARE(failed.last().at(0).toString(), QString("Couldn't extract plans.zip: plans.txt: LC_ALL=unset LC_MESSAGES=C LC_CTYPE=%1")
+                                                     .arg(QString::fromLocal8Bit(setlocale(LC_CTYPE, nullptr))));
+    }
+
+    void fileOpsExtractNamesWhatARenameLeft()
+    {
+        // An unpack that can't be named goes the way a failed one does: removed, or named where it's left.
+        if (geteuid() == 0)
+            QSKIP("Root can write in a read-only folder.");
+        QTemporaryDir dir;
+        write(dir.filePath(".folio-test"), "");
+        QVERIFY(QDir().mkdir(dir.filePath("bin")));
+        QVERIFY(QDir().mkdir(dir.filePath("in")));
+        write(dir.filePath("in/plans.zip"), "");
+        // Unpacks a file into the folder it's given, the last argument, then makes the archive's folder read-only.
+        write(dir.filePath("bin/bsdtar"), "#!/bin/sh\nfor last; do :; done\necho x > \"$last/plans.txt\" && chmod a-w \"$(dirname \"$(dirname \"$last\")\")\"\n");
+        QVERIFY(QFile::setPermissions(dir.filePath("bin/bsdtar"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        const QByteArray path = qgetenv("PATH");
+        const auto restore = qScopeGuard([&] {
+            qputenv("PATH", path);
+            QFile::setPermissions(dir.filePath("in"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        });
+        qputenv("PATH", QFile::encodeName(dir.filePath("bin")) + ':' + path);
+        FileOps ops;
+        QSignalSpy failed(&ops, &FileOps::failed), done(&ops, &FileOps::done);
+        ops.extract(dir.filePath("in/plans.zip"));
+        QVERIFY(failed.wait(5000));
+        const QStringList left = QDir(dir.filePath("in")).entryList({".extracting-*"}, QDir::Dirs | QDir::Hidden);
+        const QString message = failed.last().at(0).toString();
+        QVERIFY2(left.size() == 1, qPrintable(message));
+        QVERIFY2(message.startsWith("Couldn't extract plans.zip: "), qPrintable(message));
+        QVERIFY2(message.endsWith(" What it unpacked is left in " + dir.filePath("in/" + left.first()) + "."), qPrintable(message));
+        QVERIFY(done.isEmpty());
+        QCOMPARE(ops.busy(), QString());
     }
 
     void fileOpsTakeAFolderOnceWithWhatsInIt()

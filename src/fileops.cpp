@@ -8,13 +8,16 @@
 #include <QMimeData>
 #include <QMimeDatabase>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QSet>
 #include <QStorageInfo>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QThreadPool>
 #include <QUrl>
 #include <QtConcurrent>
 #include <unistd.h>
+#include <clocale>
 
 // GIO's headers use `signals` as a struct member, which Qt defines as a
 // keyword.
@@ -414,6 +417,101 @@ void FileOps::compress(const QStringList &selected) {
             });
 }
 
+bool FileOps::canExtract(const QString &mime) {
+    static const QStringList archives{"application/zip", "application/x-tar", "application/x-compressed-tar",
+                                      "application/x-xz-compressed-tar", "application/x-bzip2-compressed-tar",
+                                      "application/x-zstd-compressed-tar", "application/x-7z-compressed",
+                                      "application/vnd.rar", "application/x-cpio"};
+    return archives.contains(mime);
+}
+
+// From "Enter passphrase:plans.txt: Too many incorrect passphrases: Unknown error -1\nbsdtar: Error exit delayed from previous errors".
+static QString extractError(const QString &archive, const QByteArray &errors) {
+    // libarchive's endings for an entry it can't read without a password, after the entry's name.
+    static const QStringList locked{"Passphrase required for this entry", "Incorrect passphrase",
+                                    "Too many incorrect passphrases", "Encryption is not supported",
+                                    "RAR encryption support unavailable", "is encrypted, but currently not supported",
+                                    "Reading encrypted data is not currently supported"};
+    // Its prompts, with no terminal to show them, and an error number that says nothing to a person.
+    static const QRegularExpression prompts("^(Enter passphrase:)+"), number(": Unknown error -?\\d+$");
+    QString why;
+    for (QString line : QString::fromUtf8(errors).split('\n', Qt::SkipEmptyParts)) {
+        line = line.remove(prompts).remove(number).trimmed();
+        if (line.startsWith("bsdtar: "))
+            line = line.mid(QStringLiteral("bsdtar: ").size());
+        for (const QString &ending : locked)
+            if (line.endsWith(ending))
+                return FileOps::tr("Couldn't extract %1: it's protected by a password.").arg(archive);
+        if (why.isEmpty() && !line.startsWith("Removing leading") && line != "Error exit delayed from previous errors")
+            why = line;
+    }
+    return why.isEmpty() ? FileOps::tr("Couldn't extract %1.").arg(archive) : FileOps::tr("Couldn't extract %1: %2").arg(archive, why);
+}
+
+void FileOps::extract(const QString &path) {
+    if (path.isEmpty() || !idle())
+        return;
+    const QFileInfo info(path);
+    const QString archive = info.fileName(), folder = info.absolutePath();
+    const int dot = extensionStart(archive, false);
+    // "photos" for photos.tar.gz; "..zip" would make "." of it.
+    QString name = dot > 0 ? archive.left(dot) : archive;
+    if (name == "." || name == "..")
+        name = archive;
+    // Unpacked out of sight beside the archive and named once done; removed off the UI thread, as it can hold many files.
+    std::shared_ptr<QTemporaryDir> temporary(new QTemporaryDir(QDir(folder).filePath(".extracting-XXXXXX")),
+                                             [](QTemporaryDir *dir) { QThreadPool::globalInstance()->start([dir] { delete dir; }); });
+    // A folder made inside it gets the usual permissions; the hidden one is its owner's alone.
+    if (!temporary->isValid()) {
+        emit failed(tr("Couldn't extract %1: %2").arg(archive, temporary->errorString()));
+        return;
+    }
+    const QString unpacked = temporary->filePath(name);
+    if (!QDir().mkdir(unpacked)) {
+        emit failed(tr("Couldn't extract %1.").arg(archive));
+        return;
+    }
+    // Never -P, so bsdtar refuses "..", drops a leading "/", and won't write through a link it unpacked.
+    const QStringList args{"-x", "--no-same-owner", "--no-same-permissions", "-f", info.absoluteFilePath(), "-C", unpacked};
+    // No input and no terminal, so a password prompt fails at once instead of waiting.
+    auto *process = new QProcess(this);
+    process->setStandardInputFile(QProcess::nullDevice());
+    process->setUnixProcessParameters(QProcess::UnixProcessFlag::CreateNewSession);
+    // Its messages in C, the one wording extractError reads; names stay in the user's character set.
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.remove("LC_ALL");
+    environment.insert("LC_CTYPE", QString::fromLocal8Bit(setlocale(LC_CTYPE, nullptr)));
+    environment.insert("LC_MESSAGES", "C");
+    process->setProcessEnvironment(environment);
+    startTool(process, "bsdtar", args, tr("Extracting %1…").arg(archive), tr("Extracting needs bsdtar, from the libarchive package."),
+              [this, temporary, unpacked, folder, name, archive](QProcess *process, int code) {
+                  // What it unpacked goes before saying why, still busy so nothing starts on top of it.
+                  const auto fail = [this, temporary, archive](const QString &why) {
+                      temporary->setAutoRemove(false);
+                      inBackground(
+                          tr("Extracting %1…").arg(archive), [path = temporary->path()] { return QDir(path).removeRecursively(); },
+                          [this, why, path = temporary->path()](bool removed) {
+                              emit failed(removed ? why : why + ' ' + tr("What it unpacked is left in %1.").arg(path));
+                          });
+                  };
+                  if (code != 0) {
+                      fail(extractError(archive, process->readAllStandardError()));
+                      return;
+                  }
+                  // A rename never overwrites, so if another took the free name first, it takes the next.
+                  QFile made(unpacked);
+                  QString named = freeName(folder, name);
+                  while (!made.rename(QDir(folder).filePath(named))) {
+                      if (!QFileInfo::exists(QDir(folder).filePath(named))) {
+                          fail(tr("Couldn't extract %1: %2").arg(archive, made.errorString()));
+                          return;
+                      }
+                      named = freeName(folder, name);
+                  }
+                  emit done(folder, named);
+              });
+}
+
 void FileOps::shareLocalSend(const QStringList &paths) {
     // The same command Omarchy's Nautilus extension runs.
     if (paths.isEmpty())
@@ -764,7 +862,11 @@ void FileOps::runTool(const QString &program, const QStringList &args, const QSt
                       const std::function<void(QProcess *, int)> &finished) {
     if (!idle())
         return;
-    auto *process = new QProcess(this);
+    startTool(new QProcess(this), program, args, busy, missing, finished);
+}
+
+void FileOps::startTool(QProcess *process, const QString &program, const QStringList &args, const QString &busy,
+                        const QString &missing, const std::function<void(QProcess *, int)> &finished) {
     setBusy(busy);
     connect(process, &QProcess::finished, this, [this, process, finished](int code, QProcess::ExitStatus status) {
         process->deleteLater();

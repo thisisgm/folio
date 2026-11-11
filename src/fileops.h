@@ -50,6 +50,10 @@ public:
     Q_INVOKABLE void duplicate(const QString &path);
     // Packs the items into a .zip beside them (bsdtar, from libarchive).
     Q_INVOKABLE void compress(const QStringList &paths);
+    // Unpacks an archive into a new folder beside it, named after it (bsdtar, from libarchive).
+    Q_INVOKABLE void extract(const QString &path);
+    // Whether extract() unpacks this type: an archive, not a lone compressed file such as notes.txt.gz.
+    Q_INVOKABLE static bool canExtract(const QString &mime);
     // Sends with LocalSend to a nearby device, or with Taildrop to a
     // machine on the tailnet.
     Q_INVOKABLE void shareLocalSend(const QStringList &paths);
@@ -151,6 +155,9 @@ private:
     // or -1 if it crashed.
     void runTool(const QString &program, const QStringList &args, const QString &busy, const QString &missing,
                  const std::function<void(QProcess *, int)> &finished);
+    // What runTool does once the process is made, for a tool that needs it set up first (bsdtar extracting).
+    void startTool(QProcess *process, const QString &program, const QStringList &args, const QString &busy,
+                   const QString &missing, const std::function<void(QProcess *, int)> &finished);
 
     QString m_busy;
 };
